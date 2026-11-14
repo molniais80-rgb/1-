@@ -30,8 +30,8 @@ from aiogram.types import (
 
 # --- НАСТРОЙКИ ---
 # Берутся из переменных окружения; можно задать и прямо в коде, заменив значения после запятой
-BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН_ОТ_BOTFATHER")
-_ADMIN_RAW = os.getenv("ADMIN_IDS", "123456789")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9069974428:AAGKOo4vw-aS1AG2Sdj6zDhkbCJ8Ein0mPs")
+_ADMIN_RAW = os.getenv("ADMIN_IDS", "8863549439")
 ADMIN_IDS = {int(x) for x in _ADMIN_RAW.split(",") if x.strip().isdigit()}
 
 SUB_PRICES = {1: 20, 7: 100, 30: 370}  # дней: цена в звёздах
