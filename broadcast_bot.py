@@ -28,6 +28,13 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 
+try:  # Telethon нужен только для рассылки от имени аккаунта (/sender me)
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+
 # --- НАСТРОЙКИ ---
 # Берутся из переменных окружения; можно задать и прямо в коде, заменив значения после запятой
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9069974428:AAGKOo4vw-aS1AG2Sdj6zDhkbCJ8Ein0mPs")
@@ -38,6 +45,11 @@ SUB_PRICES = {1: 20, 7: 100, 30: 370}  # дней: цена в звёздах
 PAUSE_BETWEEN_SENDS = 0.15  # сек между отправками (~6-7 сообщ/сек, безопасный темп)
 
 DB_PATH = Path(os.getenv("DB_PATH", "broadcast.db"))
+API_ID = int(os.getenv("API_ID", "0") or 0)      # my.telegram.org — для юзер-режима
+API_HASH = os.getenv("API_HASH", "")
+TELE_SESSION = os.getenv("TELE_SESSION", "")     # StringSession из import_folder.py
+USER_SEND_PAUSE = float(os.getenv("USER_SEND_PAUSE", "2.0"))  # пауза при рассылке от аккаунта
+user_client = None  # Telethon-клиент аккаунта, заполняется в start_userbot()
 db = sqlite3.connect(DB_PATH)
 db.execute("CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
 db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '')")
@@ -179,34 +191,58 @@ def parse_target(raw: str) -> int | str | None:
 
 
 # --- Рассылка ---
+async def _send_one(bot: Bot, chat_id: int, text: str | None, source: Message | None, as_user: bool) -> str:
+    """Одна отправка. Возвращает: ok / forbidden / flood:<сек> / err."""
+    try:
+        if as_user:
+            await user_client.send_message(chat_id, text or "")
+        elif source is not None:
+            await source.copy_to(chat_id)
+        else:
+            await bot.send_message(chat_id, text or "")
+        return "ok"
+    except TelegramForbiddenError:
+        return "forbidden"
+    except TelegramRetryAfter as e:
+        return f"flood:{e.retry_after}"
+    except Exception as e:
+        wait = getattr(e, "seconds", 0) or getattr(e, "retry_after", 0)
+        if wait and type(e).__name__ == "FloodWaitError":
+            return f"flood:{int(wait)}"
+        log.warning("Чат %s: %s: %s", chat_id, type(e).__name__, e)
+        return "err"
+
+
 async def broadcast(bot: Bot, text: str | None = None, source: Message | None = None) -> tuple[int, int, int]:
-    """Отправка всем выбранным чатам. Возвращает (отправлено, убрано, ошибок)."""
+    """Отправка всем выбранным чатам. Возвращает (отправлено, убрано, ошибок).
+    Если включён /sender me и поднят юзер-клиент — идёт от имени аккаунта."""
+    send_as_user = kv_get("sender", "bot") == "me" and user_client is not None
+    if send_as_user and source is not None:
+        text = (source.text or source.caption or "") or text
+        source = None  # копирование медиа работает только от имени бота
     sent = skipped = errors = 0
     for chat_id, _title in all_chats():
-        try:
-            if source is not None:
-                await source.copy_to(chat_id)
-            else:
-                await bot.send_message(chat_id, text or "")
+        status = await _send_one(bot, chat_id, text, source, send_as_user)
+        if status == "ok":
             sent += 1
-        except TelegramRetryAfter as e:
-            log.warning("FloodWait %s сек, чат %s", e.retry_after, chat_id)
-            await asyncio.sleep(e.retry_after)
-            try:
-                if source is not None:
-                    await source.copy_to(chat_id)
-                else:
-                    await bot.send_message(chat_id, text or "")
-                sent += 1
-            except Exception:
-                errors += 1
-        except TelegramForbiddenError:
+        elif status == "forbidden":
             remove_chat(chat_id)
             skipped += 1
-        except Exception as e:
+        elif status.startswith("flood:"):
+            wait = float(status.split(":")[1])
+            log.warning("FloodWait %s сек, чат %s", wait, chat_id)
+            await asyncio.sleep(wait)
+            status = await _send_one(bot, chat_id, text, source, send_as_user)
+            if status == "ok":
+                sent += 1
+            elif status == "forbidden":
+                remove_chat(chat_id)
+                skipped += 1
+            else:
+                errors += 1
+        else:
             errors += 1
-            log.warning("Чат %s: %s: %s", chat_id, type(e).__name__, e)
-        await asyncio.sleep(PAUSE_BETWEEN_SENDS)
+        await asyncio.sleep(USER_SEND_PAUSE if send_as_user else PAUSE_BETWEEN_SENDS)
     return sent, skipped, errors
 
 
@@ -222,6 +258,8 @@ async def cmd_start(msg: Message) -> None:
         "/settext <текст> — сохранить текст для рассылки\n\n"
         "Для администрации:\n"
         "/grant <id> <дней> — выдать подписку вручную\n"
+        "/sender me | /sender bot — рассылка от аккаунта или от бота\n"
+        "/addchats — массовое добавление чатов списком\n"
         "/addchat, /delchat, /chats, /auto, /status — управление\n\n"
         "Для владельца:\n"
         "/addadmin <id> — назначить администратора\n"
@@ -374,6 +412,46 @@ async def cmd_admins(msg: Message) -> None:
 
 
 # --- Хендлеры: рассылка ---
+@router.message(Command("addchats"))
+@staff_only
+async def cmd_addchats(msg: Message) -> None:
+    """Массовое добавление списком: одна строка — один чат.
+    Формат строки: "-1001234567890 Название" или просто "-1001234567890".
+    Можно отправить ответом на сообщение со списком."""
+    body = msg.text.split(maxsplit=1)[1] if len(msg.text.split(maxsplit=1)) > 1 else ""
+    if not body and msg.reply_to_message:
+        body = msg.reply_to_message.text or msg.reply_to_message.caption or ""
+    entries = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not entries:
+        await msg.answer("Формат (одна строка — один чат):\n/addchats -1001234567890 Название\n-1009876543210")
+        return
+    added = failed = 0
+    details: list[str] = []
+    for line in entries:
+        parts = line.split(maxsplit=1)
+        raw = parts[0]
+        title = parts[1].strip() if len(parts) > 1 else ""
+        if not raw.lstrip("-").isdigit():
+            failed += 1
+            details.append(f"✗ {line[:40]} (ID не число)")
+            continue
+        chat_id = int(raw)
+        real_title = title
+        try:  # если бот уже в чате (скрипт импорта его добавил) — возьмём настоящее имя
+            chat = await msg.bot.get_chat(chat_id)
+            real_title = chat.title or chat.username or title or str(chat_id)
+        except Exception:
+            real_title = title or f"чат {chat_id}"
+        if add_chat(chat_id, real_title):
+            added += 1
+        else:
+            details.append(f"• {chat_id} — уже в списке")
+    text = f"Добавлено: {added}, ошибок: {failed}."
+    if details:
+        text += "\n" + "\n".join(details[:20])
+    await msg.answer(text)
+
+
 @router.message(Command("addchat"))
 @staff_only
 async def cmd_addchat(msg: Message) -> None:
@@ -497,10 +575,33 @@ async def cmd_status(msg: Message) -> None:
     text = kv_get("text") or "(не задан)"
     preview = text if len(text) <= 200 else text[:200] + "…"
     auto = f"каждые {minutes} мин" if minutes != "0" else "выключен"
+    mode = "твой аккаунт" if kv_get("sender", "bot") == "me" else "бот"
     subs_active = db.execute("SELECT COUNT(*) FROM subs WHERE expires_at > ?", (time.time(),)).fetchone()[0]
     await msg.answer(
-        f"Чатов: {len(all_chats())}\nАвтопостинг: {auto}\nАктивных подписок: {subs_active}\nСохранённый текст:\n{preview}"
+        f"Чатов: {len(all_chats())}\nАвтопостинг: {auto}\nРассылка от: {mode}\nАктивных подписок: {subs_active}\nСохранённый текст:\n{preview}"
     )
+
+
+@router.message(Command("sender"))
+@staff_only
+async def cmd_sender(msg: Message) -> None:
+    """Переключает, кто рассылает: бот (/sender bot) или твой аккаунт (/sender me)."""
+    arg = msg.text.split(maxsplit=1)[1].strip().lower() if len(msg.text.split(maxsplit=1)) > 1 else ""
+    if arg in ("me", "я", "аккаунт"):
+        if user_client is None:
+            await msg.answer(
+                "Юзер-режим не поднят. Нужны переменные окружения API_ID, API_HASH и TELE_SESSION\n"
+                "(TELE_SESSION печатает import_folder.py и сохраняет в session_string.txt)."
+            )
+            return
+        kv_set("sender", "me")
+        await msg.answer("Рассылка теперь идёт ОТ ТВОЕГО ИМЕНИ. Вернуть бота: /sender bot")
+    elif arg in ("bot", "бот"):
+        kv_set("sender", "bot")
+        await msg.answer("Рассылка от имени бота.")
+    else:
+        mode = "твой аккаунт" if kv_get("sender", "bot") == "me" else "бот"
+        await msg.answer(f"Сейчас рассылает: {mode}.\nСменить: /sender me или /sender bot")
 
 
 # --- Автопостинг ---
@@ -522,16 +623,47 @@ async def auto_loop(bot: Bot) -> None:
 
 
 # --- Запуск ---
+async def start_userbot() -> None:
+    """Поднимает Telethon-клиент аккаунта для режима /sender me."""
+    global user_client
+    if not TELETHON_AVAILABLE:
+        log.info("Telethon не установлен — юзер-режим недоступен (pip install telethon)")
+        return
+    if not API_ID or not API_HASH:
+        log.info("API_ID/API_HASH не заданы — юзер-режим недоступен")
+        return
+    session = StringSession(TELE_SESSION) if TELE_SESSION else "import_session"
+    client = TelegramClient(session, API_ID, API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        log.info("Сессия аккаунта не авторизована — войди локально через import_folder.py")
+        await client.disconnect()
+        return
+    try:  # кэш диалогов: чтобы Telethon находил чаты по ID
+        async for _dlg in client.iter_dialogs(limit=1000):
+            pass
+    except Exception:
+        log.exception("Не удалось прогрузить диалоги аккаунта")
+    user_client = client
+    log.info("Юзер-режим активен: рассылка может идти от имени аккаунта")
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
     dp = Dispatcher()
     dp.include_router(router)
+    try:
+        await start_userbot()
+    except Exception:
+        log.exception("Юзер-клиент не запустился — работаем только через бота")
     worker = asyncio.create_task(auto_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
         worker.cancel()
+        if user_client is not None:
+            await user_client.disconnect()
         db.close()
 
 
